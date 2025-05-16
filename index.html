@@ -1,23 +1,224 @@
 <!DOCTYPE html>
 <html lang="de">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>ChatApp Secure</title>
-  <link rel="stylesheet" href="style.css" />
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sicherer Firebase Chat (RTDB) mit E2EE</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #f9f9f9; }
+  header { background: #6200ee; color: white; padding: 1rem; text-align: center; }
+  #login, #chat, #register { max-width: 480px; margin: 2rem auto; padding: 1rem; background: white; border-radius: 8px; box-shadow: 0 0 10px #ccc; }
+  input, button, select, textarea { width: 100%; margin: 0.5rem 0; padding: 0.5rem; font-size: 1rem; }
+  #messages { max-height: 300px; overflow-y: auto; border: 1px solid #ddd; padding: 0.5rem; background: #fff; margin-bottom: 1rem; }
+  .message { margin-bottom: 0.5rem; }
+  .message .sender { font-weight: bold; }
+  .message .text { margin-left: 1rem; }
+  #chatHeader { display: flex; justify-content: space-between; align-items: center; }
+  #chatMembers { font-size: 0.9rem; color: #555; }
+</style>
 </head>
 <body>
-  <div id="chat-container">
-    <h2>Sicherer Chat</h2>
-    <div id="messages"></div>
-    <input type="text" id="message-input" placeholder="Nachricht eingeben..." />
-    <button onclick="sendMessage()">Senden</button>
-    <button onclick="logout()">Logout</button>
+
+<header>
+  <h1>Sicherer Firebase Chat (RTDB) mit E2EE</h1>
+</header>
+
+<div id="register" style="display:none;">
+  <h2>Registrieren</h2>
+  <input type="email" id="regEmail" placeholder="E-Mail" />
+  <input type="password" id="regPass" placeholder="Passwort" />
+  <button id="btnRegister">Registrieren</button>
+  <p>Schon registriert? <a href="#" id="showLogin">Hier einloggen</a></p>
+  <div id="regError" style="color:red;"></div>
+</div>
+
+<div id="login">
+  <h2>Login</h2>
+  <input type="email" id="loginEmail" placeholder="E-Mail" />
+  <input type="password" id="loginPass" placeholder="Passwort" />
+  <button id="btnLogin">Einloggen</button>
+  <p>Noch kein Konto? <a href="#" id="showRegister">Hier registrieren</a></p>
+  <div id="loginError" style="color:red;"></div>
+</div>
+
+<div id="chat" style="display:none;">
+  <div id="chatHeader">
+    <h2>Chats</h2>
+    <button id="btnLogout">Logout</button>
   </div>
-  <script src="https://www.gstatic.com/firebasejs/10.0.0/firebase-app-compat.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/10.0.0/firebase-auth-compat.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/10.0.0/firebase-firestore-compat.js"></script>
-  <script src="firebase-config.js"></script>
-  <script src="app.js"></script>
-</body>
-</html>
+
+  <div>
+    <label for="newChatMembers">Neuen Chat mit User(s) (UIDs, Komma getrennt):</label>
+    <input type="text" id="newChatMembers" placeholder="z.B. uid1,uid2,uid3" />
+    <button id="btnCreateChat">Chat erstellen</button>
+    <div id="createChatError" style="color:red;"></div>
+  </div>
+
+  <hr />
+
+  <select id="chatList" size="5" style="width:100%;"></select>
+
+  <div id="chatWindow" style="display:none; margin-top:1rem;">
+    <div id="chatMembers"></div>
+    <div id="messages"></div>
+    <textarea id="messageInput" rows="3" placeholder="Nachricht schreiben..."></textarea>
+    <button id="btnSend">Senden</button>
+  </div>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-database-compat.js"></script>
+
+<script>
+  // ======== Füge hier deine Firebase-Konfiguration ein ========
+  const firebaseConfig = {
+    apiKey: "DEIN_API_KEY",
+    authDomain: "DEIN_PROJEKT.firebaseapp.com",
+    databaseURL: "https://DEIN_PROJEKT.firebaseio.com",
+    projectId: "DEIN_PROJEKT",
+    storageBucket: "DEIN_PROJEKT.appspot.com",
+    messagingSenderId: "SENDER_ID",
+    appId: "APP_ID"
+  };
+
+  firebase.initializeApp(firebaseConfig);
+  const auth = firebase.auth();
+  const db = firebase.database();
+
+  // Verschlüsselung mit Web Crypto API (AES-GCM)
+  async function generateKey() {
+    return await crypto.subtle.generateKey(
+      { name: "AES-GCM", length: 256 },
+      true,
+      ["encrypt", "decrypt"]
+    );
+  }
+
+  async function exportKey(key) {
+    const raw = await crypto.subtle.exportKey("raw", key);
+    return btoa(String.fromCharCode(...new Uint8Array(raw)));
+  }
+
+  async function importKey(base64) {
+    const raw = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+    return await crypto.subtle.importKey(
+      "raw",
+      raw,
+      "AES-GCM",
+      true,
+      ["encrypt", "decrypt"]
+    );
+  }
+
+  async function encryptMessage(key, message) {
+    const enc = new TextEncoder();
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const encoded = enc.encode(message);
+    const ciphertext = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv },
+      key,
+      encoded
+    );
+    // IV + Ciphertext zusammen in Base64
+    const combined = new Uint8Array(iv.length + ciphertext.byteLength);
+    combined.set(iv);
+    combined.set(new Uint8Array(ciphertext), iv.length);
+    return btoa(String.fromCharCode(...combined));
+  }
+
+  async function decryptMessage(key, data) {
+    const combined = Uint8Array.from(atob(data), c => c.charCodeAt(0));
+    const iv = combined.slice(0, 12);
+    const ciphertext = combined.slice(12);
+    const decrypted = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv },
+      key,
+      ciphertext
+    );
+    const dec = new TextDecoder();
+    return dec.decode(decrypted);
+  }
+
+  // Nutzer-Session & Schlüssel pro Chat
+  let currentUser = null;
+  let currentChatId = null;
+  let currentChatKey = null; // symmetrischer Schlüssel (Base64)
+  let chatKeys = {}; // { chatId: CryptoKey }
+
+  // UI Elemente
+  const loginDiv = document.getElementById("login");
+  const registerDiv = document.getElementById("register");
+  const chatDiv = document.getElementById("chat");
+  const loginEmail = document.getElementById("loginEmail");
+  const loginPass = document.getElementById("loginPass");
+  const btnLogin = document.getElementById("btnLogin");
+  const loginError = document.getElementById("loginError");
+
+  const regEmail = document.getElementById("regEmail");
+  const regPass = document.getElementById("regPass");
+  const btnRegister = document.getElementById("btnRegister");
+  const regError = document.getElementById("regError");
+
+  const btnLogout = document.getElementById("btnLogout");
+
+  const newChatMembers = document.getElementById("newChatMembers");
+  const btnCreateChat = document.getElementById("btnCreateChat");
+  const createChatError = document.getElementById("createChatError");
+
+  const chatList = document.getElementById("chatList");
+  const chatWindow = document.getElementById("chatWindow");
+  const chatMembers = document.getElementById("chatMembers");
+  const messagesDiv = document.getElementById("messages");
+  const messageInput = document.getElementById("messageInput");
+  const btnSend = document.getElementById("btnSend");
+
+  // Zeige Login oder Register
+  document.getElementById("showRegister").addEventListener("click", e => {
+    e.preventDefault();
+    loginDiv.style.display = "none";
+    registerDiv.style.display = "block";
+  });
+  document.getElementById("showLogin").addEventListener("click", e => {
+    e.preventDefault();
+    registerDiv.style.display = "none";
+    loginDiv.style.display = "block";
+  });
+
+  // Registrierung
+  btnRegister.addEventListener("click", async () => {
+    regError.textContent = "";
+    try {
+      const userCred = await auth.createUserWithEmailAndPassword(regEmail.value, regPass.value);
+      currentUser = userCred.user;
+      alert("Registrierung erfolgreich! Bitte jetzt einloggen.");
+      registerDiv.style.display = "none";
+      loginDiv.style.display = "block";
+    } catch (e) {
+      regError.textContent = e.message;
+    }
+  });
+
+  // Login
+  btnLogin.addEventListener("click", async () => {
+    loginError.textContent = "";
+    try {
+      const userCred = await auth.signInWithEmailAndPassword(loginEmail.value, loginPass.value);
+      currentUser = userCred.user;
+      initAfterLogin();
+    } catch (e) {
+      loginError.textContent = e.message;
+    }
+  });
+
+  // Logout
+  btnLogout.addEventListener("click", async () => {
+    await auth.signOut();
+    currentUser = null;
+    chatDiv.style.display = "none";
+    loginDiv.style.display = "block";
+    chatList.innerHTML = "";
+    chatWindow.style.display = "none";
+  });
+
+  //
